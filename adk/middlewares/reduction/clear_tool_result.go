@@ -18,6 +18,7 @@ package reduction
 
 import (
 	"context"
+	"slices"
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/schema"
@@ -152,10 +153,5 @@ func reduceByTokens(state *adk.ChatModelAgentState, toolResultTokenThreshold, ke
 }
 
 func excluded(name string, exclude []string) bool {
-	for _, ex := range exclude {
-		if name == ex {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(exclude, name)
 }

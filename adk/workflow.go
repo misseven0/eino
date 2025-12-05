@@ -155,9 +155,13 @@ type WorkflowInterruptInfo struct {
 	ParallelInterruptInfo map[int] /*index*/ *InterruptInfo
 }
 
-func (a *workflowAgent) runSequential(ctx context.Context,
-	generator *AsyncGenerator[*AgentEvent], seqState *sequentialWorkflowState, info *ResumeInfo,
-	opts ...AgentRunOption) (err error) {
+func (a *workflowAgent) runSequential(
+	ctx context.Context,
+	generator *AsyncGenerator[*AgentEvent],
+	seqState *sequentialWorkflowState,
+	info *ResumeInfo,
+	opts ...AgentRunOption,
+) (err error) {
 
 	startIdx := 0
 
