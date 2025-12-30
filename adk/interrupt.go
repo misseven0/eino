@@ -161,6 +161,8 @@ func init() {
 	schema.RegisterName[*State]("_eino_adk_react_state")
 }
 
+// serialization CheckpointSchema: root checkpoint payload (gob).
+// Any type tagged with `CheckpointSchema:` is persisted and must remain backward compatible.
 type serialization struct {
 	RunCtx *runContext
 	// deprecated: still keep it here for backward compatibility
@@ -171,24 +173,23 @@ type serialization struct {
 }
 
 func (r *Runner) loadCheckPoint(ctx context.Context, checkpointID string) (
-	context.Context, *ResumeInfo, error) {
+	context.Context, *runContext, *ResumeInfo, error) {
 	data, existed, err := r.store.Get(ctx, checkpointID)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get checkpoint from store: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to get checkpoint from store: %w", err)
 	}
 	if !existed {
-		return nil, nil, fmt.Errorf("checkpoint[%s] not exist", checkpointID)
+		return nil, nil, nil, fmt.Errorf("checkpoint[%s] not exist", checkpointID)
 	}
 
 	s := &serialization{}
 	err = gob.NewDecoder(bytes.NewReader(data)).Decode(s)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to decode checkpoint: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to decode checkpoint: %w", err)
 	}
 	ctx = core.PopulateInterruptState(ctx, s.InterruptID2Address, s.InterruptID2State)
-	ctx = setRunCtx(ctx, s.RunCtx)
 
-	return ctx, &ResumeInfo{
+	return ctx, s.RunCtx, &ResumeInfo{
 		EnableStreaming: s.EnableStreaming,
 		InterruptInfo:   s.Info,
 	}, nil
@@ -218,32 +219,32 @@ func (r *Runner) saveCheckPoint(
 	return r.store.Set(ctx, key, buf.Bytes())
 }
 
-const mockCheckPointID = "adk_react_mock_key"
+const bridgeCheckpointID = "adk_react_mock_key"
 
-func newEmptyStore() *mockStore {
-	return &mockStore{}
+func newBridgeStore() *bridgeStore {
+	return &bridgeStore{}
 }
 
-func newResumeStore(data []byte) *mockStore {
-	return &mockStore{
+func newResumeBridgeStore(data []byte) *bridgeStore {
+	return &bridgeStore{
 		Data:  data,
 		Valid: true,
 	}
 }
 
-type mockStore struct {
+type bridgeStore struct {
 	Data  []byte
 	Valid bool
 }
 
-func (m *mockStore) Get(_ context.Context, _ string) ([]byte, bool, error) {
+func (m *bridgeStore) Get(_ context.Context, _ string) ([]byte, bool, error) {
 	if m.Valid {
 		return m.Data, true, nil
 	}
 	return nil, false, nil
 }
 
-func (m *mockStore) Set(_ context.Context, _ string, checkPoint []byte) error {
+func (m *bridgeStore) Set(_ context.Context, _ string, checkPoint []byte) error {
 	m.Data = checkPoint
 	m.Valid = true
 	return nil

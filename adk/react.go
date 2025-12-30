@@ -41,19 +41,51 @@ type State struct {
 	RemainingIterations int
 }
 
+// SendToolGenAction attaches an AgentAction to the next tool event emitted for the
+// current tool execution.
+//
+// Where/when to use:
+//   - Invoke within a tool's Run (Invokable/Streamable) implementation to include
+//     an action alongside that tool's output event.
+//   - The action is scoped by the current tool call context: if a ToolCallID is
+//     available, it is used as the key to support concurrent calls of the same
+//     tool with different parameters; otherwise, the provided toolName is used.
+//   - The stored action is ephemeral and will be popped and attached to the tool
+//     event when the tool finishes (including streaming completion).
+//
+// Limitation:
+//   - This function is intended for use within ChatModelAgent runs only. It relies
+//     on ChatModelAgent's internal State to store and pop actions, which is not
+//     available in other agent types.
 func SendToolGenAction(ctx context.Context, toolName string, action *AgentAction) error {
+	key := toolName
+	toolCallID := compose.GetToolCallID(ctx)
+	if len(toolCallID) > 0 {
+		key = toolCallID
+	}
+
 	return compose.ProcessState(ctx, func(ctx context.Context, st *State) error {
-		st.ToolGenActions[toolName] = action
+		st.ToolGenActions[key] = action
 
 		return nil
 	})
 }
 
 func popToolGenAction(ctx context.Context, toolName string) *AgentAction {
+	toolCallID := compose.GetToolCallID(ctx)
+
 	var action *AgentAction
 	err := compose.ProcessState(ctx, func(ctx context.Context, st *State) error {
-		action = st.ToolGenActions[toolName]
-		if action != nil {
+		if len(toolCallID) > 0 {
+			if a := st.ToolGenActions[toolCallID]; a != nil {
+				action = a
+				delete(st.ToolGenActions, toolCallID)
+				return nil
+			}
+		}
+
+		if a := st.ToolGenActions[toolName]; a != nil {
+			action = a
 			delete(st.ToolGenActions, toolName)
 		}
 
@@ -79,6 +111,8 @@ type reactConfig struct {
 	maxIterations int
 
 	beforeChatModel, afterChatModel []func(context.Context, *ChatModelAgentState) error
+
+	modelRetryConfig *ModelRetryConfig
 }
 
 func genToolInfos(ctx context.Context, config *compose.ToolsNodeConfig) ([]*schema.ToolInfo, error) {
@@ -139,7 +173,12 @@ func newReact(ctx context.Context, config *reactConfig) (reactGraph, error) {
 		return nil, err
 	}
 
-	chatModel, err := config.model.WithTools(toolsInfo)
+	var baseModel model.ToolCallingChatModel = config.model
+	if config.modelRetryConfig != nil {
+		baseModel = newRetryChatModel(config.model, config.modelRetryConfig)
+	}
+
+	chatModel, err := baseModel.WithTools(toolsInfo)
 	if err != nil {
 		return nil, err
 	}
