@@ -65,18 +65,21 @@ func (a *flowAgent) deepCopy() *flowAgent {
 	return ret
 }
 
+// SetSubAgents sets sub-agents for the given agent and returns the updated agent.
 func SetSubAgents(ctx context.Context, agent Agent, subAgents []Agent) (ResumableAgent, error) {
 	return setSubAgents(ctx, agent, subAgents)
 }
 
 type AgentOption func(options *flowAgent)
 
+// WithDisallowTransferToParent prevents a sub-agent from transferring to its parent.
 func WithDisallowTransferToParent() AgentOption {
 	return func(fa *flowAgent) {
 		fa.disallowTransferToParent = true
 	}
 }
 
+// WithHistoryRewriter sets a rewriter to transform conversation history.
 func WithHistoryRewriter(h HistoryRewriter) AgentOption {
 	return func(fa *flowAgent) {
 		fa.historyRewriter = h
@@ -102,6 +105,7 @@ func toFlowAgent(ctx context.Context, agent Agent, opts ...AgentOption) *flowAge
 	return fa
 }
 
+// AgentWithOptions wraps an agent with flow-specific options and returns it.
 func AgentWithOptions(ctx context.Context, agent Agent, opts ...AgentOption) Agent {
 	return toFlowAgent(ctx, agent, opts...)
 }
@@ -378,19 +382,11 @@ func (a *flowAgent) run(
 			break
 		}
 
-		// RunPath ownership: the eino framework prepends parent context exactly once.
-		// Custom agents should NOT include parent segments in event.RunPath.
-		// Any event.RunPath provided by custom agents is treated as relative child provenance.
-		// STRONG RECOMMENDATION: Do NOT set RunPath in custom agents unless you truly need to add
-		//   relative child provenance; never add parent/current segments. Incorrect settings will
-		//   duplicate head segments after merge and cause non-recording.
-		// Here we merge: framework runCtx.RunPath + custom-provided event.RunPath.
-		if len(event.RunPath) > 0 {
-			rp := make([]RunStep, 0, len(runCtx.RunPath)+len(event.RunPath))
-			rp = append(rp, runCtx.RunPath...)
-			rp = append(rp, event.RunPath...)
-			event.RunPath = rp
-		} else {
+		// RunPath ownership: the eino framework sets RunPath exactly once.
+		// If event.RunPath is already set (e.g., by agentTool), we don't modify it.
+		// If event.RunPath is nil/empty, we set it to the current runCtx.RunPath.
+		// This ensures RunPath is set exactly once and not duplicated.
+		if len(event.RunPath) == 0 {
 			event.AgentName = a.Name(ctx)
 			event.RunPath = runCtx.RunPath
 		}

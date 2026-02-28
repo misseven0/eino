@@ -285,19 +285,6 @@ func NewBreakLoopAction(agentName string) *AgentAction {
 	}}
 }
 
-func (a *workflowAgent) doBreakLoopIfNeeded(aa *AgentAction, iterations int) bool {
-	if a.mode != workflowAgentModeLoop {
-		return false
-	}
-
-	if aa != nil && aa.BreakLoop != nil && !aa.BreakLoop.Done {
-		aa.BreakLoop.Done = true
-		aa.BreakLoop.CurrentIterations = iterations
-		return true
-	}
-	return false
-}
-
 func (a *workflowAgent) runLoop(ctx context.Context, generator *AsyncGenerator[*AgentEvent],
 	loopState *loopWorkflowState, resumeInfo *ResumeInfo, opts ...AgentRunOption) (err error) {
 
@@ -348,13 +335,24 @@ func (a *workflowAgent) runLoop(ctx context.Context, generator *AsyncGenerator[*
 			loopCtx = updateRunPathOnly(loopCtx, subAgent.Name(loopCtx))
 
 			var lastActionEvent *AgentEvent
+			var breakLoopEvent *AgentEvent
 			for {
 				event, ok := subIterator.Next()
 				if !ok {
 					break
 				}
 
+				if event.Err != nil {
+					generator.Send(event)
+					return nil
+				}
+
 				if lastActionEvent != nil {
+					if lastActionEvent.Action.BreakLoop != nil && !lastActionEvent.Action.BreakLoop.Done {
+						lastActionEvent.Action.BreakLoop.Done = true
+						lastActionEvent.Action.BreakLoop.CurrentIterations = i
+						breakLoopEvent = lastActionEvent
+					}
 					generator.Send(lastActionEvent)
 					lastActionEvent = nil
 				}
@@ -367,6 +365,12 @@ func (a *workflowAgent) runLoop(ctx context.Context, generator *AsyncGenerator[*
 			}
 
 			if lastActionEvent != nil {
+				if lastActionEvent.Action.BreakLoop != nil && !lastActionEvent.Action.BreakLoop.Done {
+					lastActionEvent.Action.BreakLoop.Done = true
+					lastActionEvent.Action.BreakLoop.CurrentIterations = i
+					breakLoopEvent = lastActionEvent
+				}
+
 				if lastActionEvent.Action.internalInterrupted != nil {
 					// A sub-agent interrupted. Wrap it with our own loop state.
 					state := &loopWorkflowState{
@@ -396,12 +400,11 @@ func (a *workflowAgent) runLoop(ctx context.Context, generator *AsyncGenerator[*
 					return
 				}
 
-				if a.doBreakLoopIfNeeded(lastActionEvent.Action, i) {
-					generator.Send(lastActionEvent)
-					return
-				}
-
 				generator.Send(lastActionEvent)
+			}
+
+			if breakLoopEvent != nil {
+				return
 			}
 		}
 
@@ -584,14 +587,17 @@ func newWorkflowAgent(ctx context.Context, name, desc string,
 	return fa, nil
 }
 
+// NewSequentialAgent creates an agent that runs sub-agents sequentially.
 func NewSequentialAgent(ctx context.Context, config *SequentialAgentConfig) (ResumableAgent, error) {
 	return newWorkflowAgent(ctx, config.Name, config.Description, config.SubAgents, workflowAgentModeSequential, 0)
 }
 
+// NewParallelAgent creates an agent that runs sub-agents in parallel.
 func NewParallelAgent(ctx context.Context, config *ParallelAgentConfig) (ResumableAgent, error) {
 	return newWorkflowAgent(ctx, config.Name, config.Description, config.SubAgents, workflowAgentModeParallel, 0)
 }
 
+// NewLoopAgent creates an agent that loops over sub-agents with a max iteration limit.
 func NewLoopAgent(ctx context.Context, config *LoopAgentConfig) (ResumableAgent, error) {
 	return newWorkflowAgent(ctx, config.Name, config.Description, config.SubAgents, workflowAgentModeLoop, config.MaxIterations)
 }

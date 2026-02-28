@@ -41,6 +41,52 @@ import (
 	ub "github.com/cloudwego/eino/utils/callbacks"
 )
 
+// SendEvent sends a custom AgentEvent to the event stream during agent execution.
+// This allows ChatModelAgentMiddleware implementations to emit custom events that will be
+// received by the caller iterating over the agent's event stream.
+//
+// This function can only be called from within a ChatModelAgentMiddleware during agent execution.
+// Returns an error if called outside of an agent execution context.
+func SendEvent(ctx context.Context, event *AgentEvent) error {
+	execCtx := getChatModelAgentExecCtx(ctx)
+	if execCtx == nil || execCtx.generator == nil {
+		return fmt.Errorf("SendEvent failed: must be called within a ChatModelAgent Run() or Resume() execution context")
+	}
+	execCtx.generator.Send(event)
+	return nil
+}
+
+type chatModelAgentExecCtx struct {
+	generator *AsyncGenerator[*AgentEvent]
+}
+
+func (e *chatModelAgentExecCtx) send(event *AgentEvent) {
+	if e != nil && e.generator != nil {
+		e.generator.Send(event)
+	}
+}
+
+type chatModelAgentExecCtxKey struct{}
+
+func withChatModelAgentExecCtx(ctx context.Context, execCtx *chatModelAgentExecCtx) context.Context {
+	return context.WithValue(ctx, chatModelAgentExecCtxKey{}, execCtx)
+}
+
+func getChatModelAgentExecCtx(ctx context.Context) *chatModelAgentExecCtx {
+	if v := ctx.Value(chatModelAgentExecCtxKey{}); v != nil {
+		return v.(*chatModelAgentExecCtx)
+	}
+	return nil
+}
+
+const (
+	addrDepthChain      = 1
+	addrDepthReactGraph = 2
+	addrDepthChatModel  = 3
+	addrDepthToolsNode  = 3
+	addrDepthTool       = 4
+)
+
 type chatModelAgentRunOptions struct {
 	// run
 	chatModelOptions []model.Option
@@ -51,24 +97,28 @@ type chatModelAgentRunOptions struct {
 	historyModifier func(context.Context, []Message) []Message
 }
 
+// WithChatModelOptions sets options for the underlying chat model.
 func WithChatModelOptions(opts []model.Option) AgentRunOption {
 	return WrapImplSpecificOptFn(func(t *chatModelAgentRunOptions) {
 		t.chatModelOptions = opts
 	})
 }
 
+// WithToolOptions sets options for tools used by the chat model agent.
 func WithToolOptions(opts []tool.Option) AgentRunOption {
 	return WrapImplSpecificOptFn(func(t *chatModelAgentRunOptions) {
 		t.toolOptions = opts
 	})
 }
 
+// WithAgentToolRunOptions specifies per-tool run options for the agent.
 func WithAgentToolRunOptions(opts map[string] /*tool name*/ []AgentRunOption) AgentRunOption {
 	return WrapImplSpecificOptFn(func(t *chatModelAgentRunOptions) {
 		t.agentToolOptions = opts
 	})
 }
 
+// WithHistoryModifier sets a function to modify history during resume.
 // Deprecated: use ResumeWithData and ChatModelAgentResumeData instead.
 func WithHistoryModifier(f func(context.Context, []Message) []Message) AgentRunOption {
 	return WrapImplSpecificOptFn(func(t *chatModelAgentRunOptions) {
@@ -85,7 +135,17 @@ type ToolsConfig struct {
 	ReturnDirectly map[string]bool
 
 	// EmitInternalEvents indicates whether internal events from agentTool should be emitted
-	// to the parent generator via a tool option injection at run-time.
+	// to the parent agent's AsyncGenerator, allowing real-time streaming of nested agent output
+	// to the end-user via Runner.
+	//
+	// Note that these forwarded events are NOT recorded in the parent agent's runSession.
+	// They are only emitted to the end-user and have no effect on the parent agent's state
+	// or checkpoint.
+	//
+	// Action Scoping:
+	// Actions emitted by the inner agent are scoped to the agent tool boundary:
+	//   - Interrupted: Propagated via CompositeInterrupt to allow proper interrupt/resume
+	//   - Exit, TransferToAgent, BreakLoop: Ignored outside the agent tool
 	EmitInternalEvents bool
 }
 
@@ -103,7 +163,10 @@ func defaultGenModelInput(ctx context.Context, instruction string, input *AgentI
 			ct := prompt.FromMessages(schema.FString, sp)
 			ms, err := ct.Format(ctx, vs)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("defaultGenModelInput: failed to format instruction using FString template. "+
+					"This formatting is triggered automatically when SessionValues are present. "+
+					"If your instruction contains literal curly braces (e.g., JSON), provide a custom GenModelInput that uses another format. If you are using "+
+					"SessionValues for purposes other than instruction formatting, provide a custom GenModelInput that does no formatting at all: %w", err)
 			}
 
 			sp = ms[0]
@@ -221,6 +284,7 @@ type ChatModelAgent struct {
 
 type runFunc func(ctx context.Context, input *AgentInput, generator *AsyncGenerator[*AgentEvent], store *bridgeStore, opts ...compose.Option)
 
+// NewChatModelAgent constructs a chat model-backed agent with the provided config.
 func NewChatModelAgent(_ context.Context, config *ChatModelAgentConfig) (*ChatModelAgent, error) {
 	if config.Name == "" {
 		return nil, errors.New("agent 'Name' is required")
@@ -421,7 +485,7 @@ type cbHandler struct {
 func (h *cbHandler) onChatModelEnd(ctx context.Context,
 	_ *callbacks.RunInfo, output *model.CallbackOutput) context.Context {
 	addr := core.GetCurrentAddress(ctx)
-	if len(addr) != len(h.addr)+3 || !addr[:len(h.addr)].Equals(h.addr) {
+	if !isAddressAtDepth(addr, h.addr, addrDepthChatModel) {
 		return ctx
 	}
 
@@ -433,7 +497,7 @@ func (h *cbHandler) onChatModelEnd(ctx context.Context,
 func (h *cbHandler) onChatModelEndWithStreamOutput(ctx context.Context,
 	_ *callbacks.RunInfo, output *schema.StreamReader[*model.CallbackOutput]) context.Context {
 	addr := core.GetCurrentAddress(ctx)
-	if len(addr) != len(h.addr)+3 || !addr[:len(h.addr)].Equals(h.addr) {
+	if !isAddressAtDepth(addr, h.addr, addrDepthChatModel) {
 		return ctx
 	}
 
@@ -456,58 +520,6 @@ func (h *cbHandler) onChatModelEndWithStreamOutput(ctx context.Context,
 	return ctx
 }
 
-func (h *cbHandler) onToolEnd(ctx context.Context,
-	runInfo *callbacks.RunInfo, output *tool.CallbackOutput) context.Context {
-	addr := core.GetCurrentAddress(ctx)
-	if len(addr) != len(h.addr)+4 || !addr[:len(h.addr)].Equals(h.addr) {
-		return ctx
-	}
-
-	toolCallID := compose.GetToolCallID(ctx)
-	msg := schema.ToolMessage(output.Response, toolCallID, schema.WithToolName(runInfo.Name))
-	event := EventFromMessage(msg, nil, schema.Tool, runInfo.Name)
-
-	action := popToolGenAction(ctx, runInfo.Name)
-	event.Action = action
-
-	returnDirectlyID, hasReturnDirectly := getReturnDirectlyToolCallID(ctx)
-	if hasReturnDirectly && returnDirectlyID == toolCallID {
-		// return-directly tool event will be sent on the end of tools node to ensure this event must be the last tool event.
-		h.returnDirectlyToolEvent.Store(event)
-	} else {
-		h.Send(event)
-	}
-	return ctx
-}
-
-func (h *cbHandler) onToolEndWithStreamOutput(ctx context.Context,
-	runInfo *callbacks.RunInfo, output *schema.StreamReader[*tool.CallbackOutput]) context.Context {
-	addr := core.GetCurrentAddress(ctx)
-	if len(addr) != len(h.addr)+4 || !addr[:len(h.addr)].Equals(h.addr) {
-		return ctx
-	}
-
-	toolCallID := compose.GetToolCallID(ctx)
-	cvt := func(in *tool.CallbackOutput) (Message, error) {
-		return schema.ToolMessage(in.Response, toolCallID, schema.WithToolName(runInfo.Name)), nil
-	}
-	out := schema.StreamReaderWithConvert(output, cvt)
-	event := EventFromMessage(nil, out, schema.Tool, runInfo.Name)
-
-	action := popToolGenAction(ctx, runInfo.Name)
-	event.Action = action
-
-	returnDirectlyID, hasReturnDirectly := getReturnDirectlyToolCallID(ctx)
-	if hasReturnDirectly && returnDirectlyID == toolCallID {
-		// return-directly tool event will be sent on the end of tools node to ensure this event must be the last tool event.
-		h.returnDirectlyToolEvent.Store(event)
-	} else {
-		h.Send(event)
-	}
-
-	return ctx
-}
-
 func (h *cbHandler) sendReturnDirectlyToolEvent() {
 	if e, ok := h.returnDirectlyToolEvent.Load().(*AgentEvent); ok && e != nil {
 		h.Send(e)
@@ -516,7 +528,7 @@ func (h *cbHandler) sendReturnDirectlyToolEvent() {
 
 func (h *cbHandler) onToolsNodeEnd(ctx context.Context, _ *callbacks.RunInfo, _ []*schema.Message) context.Context {
 	addr := core.GetCurrentAddress(ctx)
-	if len(addr) != len(h.addr)+3 || !addr[:len(h.addr)].Equals(h.addr) {
+	if !isAddressAtDepth(addr, h.addr, addrDepthToolsNode) {
 		return ctx
 	}
 	h.sendReturnDirectlyToolEvent()
@@ -525,7 +537,7 @@ func (h *cbHandler) onToolsNodeEnd(ctx context.Context, _ *callbacks.RunInfo, _ 
 
 func (h *cbHandler) onToolsNodeEndWithStreamOutput(ctx context.Context, _ *callbacks.RunInfo, _ *schema.StreamReader[[]*schema.Message]) context.Context {
 	addr := core.GetCurrentAddress(ctx)
-	if len(addr) != len(h.addr)+3 || !addr[:len(h.addr)].Equals(h.addr) {
+	if !isAddressAtDepth(addr, h.addr, addrDepthToolsNode) {
 		return ctx
 	}
 	h.sendReturnDirectlyToolEvent()
@@ -544,7 +556,7 @@ func init() {
 func (h *cbHandler) onGraphError(ctx context.Context,
 	_ *callbacks.RunInfo, err error) context.Context {
 	addr := core.GetCurrentAddress(ctx)
-	if len(addr) != len(h.addr)+1 || !addr[:len(h.addr)].Equals(h.addr) {
+	if !isAddressAtDepth(addr, h.addr, addrDepthChain) {
 		return ctx
 	}
 
@@ -596,17 +608,64 @@ func genReactCallbacks(ctx context.Context, agentName string,
 		OnEnd:                 h.onChatModelEnd,
 		OnEndWithStreamOutput: h.onChatModelEndWithStreamOutput,
 	}
-	toolHandler := &ub.ToolCallbackHandler{
-		OnEnd:                 h.onToolEnd,
-		OnEndWithStreamOutput: h.onToolEndWithStreamOutput,
-	}
 	toolsNodeHandler := &ub.ToolsNodeCallbackHandlers{
 		OnEnd:                 h.onToolsNodeEnd,
 		OnEndWithStreamOutput: h.onToolsNodeEndWithStreamOutput,
 	}
-	graphHandler := callbacks.NewHandlerBuilder().OnErrorFn(h.onGraphError).Build()
+	createToolResultSender := func() adkToolResultSender {
+		return func(toolCtx context.Context, toolName, callID, result string, prePopAction *AgentAction) {
+			msg := schema.ToolMessage(result, callID, schema.WithToolName(toolName))
+			event := EventFromMessage(msg, nil, schema.Tool, toolName)
 
-	cb := ub.NewHandlerHelper().ChatModel(cmHandler).Tool(toolHandler).ToolsNode(toolsNodeHandler).Chain(graphHandler).Handler()
+			if prePopAction != nil {
+				event.Action = prePopAction
+			} else {
+				event.Action = popToolGenAction(toolCtx, toolName)
+			}
+
+			returnDirectlyID, hasReturnDirectly := getReturnDirectlyToolCallID(toolCtx)
+			if hasReturnDirectly && returnDirectlyID == callID {
+				h.returnDirectlyToolEvent.Store(event)
+			} else {
+				h.Send(event)
+			}
+		}
+	}
+	createStreamToolResultSender := func() adkStreamToolResultSender {
+		return func(toolCtx context.Context, toolName, callID string, resultStream *schema.StreamReader[string], prePopAction *AgentAction) {
+			cvt := func(in string) (Message, error) {
+				return schema.ToolMessage(in, callID, schema.WithToolName(toolName)), nil
+			}
+			msgStream := schema.StreamReaderWithConvert(resultStream, cvt)
+			event := EventFromMessage(nil, msgStream, schema.Tool, toolName)
+			event.Action = prePopAction
+
+			returnDirectlyID, hasReturnDirectly := getReturnDirectlyToolCallID(toolCtx)
+			if hasReturnDirectly && returnDirectlyID == callID {
+				h.returnDirectlyToolEvent.Store(event)
+			} else {
+				h.Send(event)
+			}
+		}
+	}
+	reactGraphHandler := callbacks.NewHandlerBuilder().
+		OnStartFn(func(ctx context.Context, info *callbacks.RunInfo, input callbacks.CallbackInput) context.Context {
+			currentAddr := core.GetCurrentAddress(ctx)
+			if !isAddressAtDepth(currentAddr, h.addr, addrDepthReactGraph) {
+				return ctx
+			}
+			return setToolResultSendersToCtx(ctx, h.addr, createToolResultSender(), createStreamToolResultSender())
+		}).
+		OnStartWithStreamInputFn(func(ctx context.Context, info *callbacks.RunInfo, input *schema.StreamReader[callbacks.CallbackInput]) context.Context {
+			currentAddr := core.GetCurrentAddress(ctx)
+			if !isAddressAtDepth(currentAddr, h.addr, addrDepthReactGraph) {
+				return ctx
+			}
+			return setToolResultSendersToCtx(ctx, h.addr, createToolResultSender(), createStreamToolResultSender())
+		}).Build()
+	chainHandler := callbacks.NewHandlerBuilder().OnErrorFn(h.onGraphError).Build()
+
+	cb := ub.NewHandlerHelper().ChatModel(cmHandler).ToolsNode(toolsNodeHandler).Graph(reactGraphHandler).Chain(chainHandler).Handler()
 
 	return compose.WithCallbacks(cb)
 }
@@ -762,7 +821,7 @@ func (a *ChatModelAgent) buildRunFunc(ctx context.Context) runFunc {
 									return nil, err
 								}
 							}
-							return in, nil
+							return state.Messages[len(state.Messages)-1], nil
 						}),
 					).
 					Compile(ctx, compose.WithGraphName(a.name),
@@ -777,6 +836,10 @@ func (a *ChatModelAgent) buildRunFunc(ctx context.Context) runFunc {
 				var runOpts []compose.Option
 				runOpts = append(runOpts, opts...)
 				runOpts = append(runOpts, callOpt)
+
+				ctx = withChatModelAgentExecCtx(ctx, &chatModelAgentExecCtx{
+					generator: generator,
+				})
 
 				var msg Message
 				var msgStream MessageStream
@@ -851,6 +914,13 @@ func (a *ChatModelAgent) buildRunFunc(ctx context.Context) runFunc {
 			if a.toolsConfig.EmitInternalEvents {
 				runOpts = append(runOpts, compose.WithToolsNodeOption(compose.WithToolOption(withAgentToolEventGenerator(generator))))
 			}
+			if input.EnableStreaming {
+				runOpts = append(runOpts, compose.WithToolsNodeOption(compose.WithToolOption(withAgentToolEnableStreaming(true))))
+			}
+
+			ctx = withChatModelAgentExecCtx(ctx, &chatModelAgentExecCtx{
+				generator: generator,
+			})
 
 			var msg Message
 			var msgStream MessageStream

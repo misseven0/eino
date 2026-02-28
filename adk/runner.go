@@ -22,7 +22,6 @@ import (
 	"runtime/debug"
 	"sync"
 
-	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/internal/core"
 	"github.com/cloudwego/eino/internal/safe"
 	"github.com/cloudwego/eino/schema"
@@ -37,14 +36,16 @@ type Runner struct {
 	enableStreaming bool
 	// store is the checkpoint store used to persist agent state upon interruption.
 	// If nil, checkpointing is disabled.
-	store compose.CheckPointStore
+	store CheckPointStore
 }
+
+type CheckPointStore = core.CheckPointStore
 
 type RunnerConfig struct {
 	Agent           Agent
 	EnableStreaming bool
 
-	CheckPointStore compose.CheckPointStore
+	CheckPointStore CheckPointStore
 }
 
 // ResumeParams contains all parameters needed to resume an execution.
@@ -57,6 +58,8 @@ type ResumeParams struct {
 	// Future extensible fields can be added here without breaking changes
 }
 
+// NewRunner creates a Runner that executes an Agent with optional streaming
+// and checkpoint persistence.
 func NewRunner(_ context.Context, conf RunnerConfig) *Runner {
 	return &Runner{
 		enableStreaming: conf.EnableStreaming,
@@ -212,7 +215,7 @@ func (r *Runner) handleIter(ctx context.Context, aIter *AsyncIterator[*AgentEven
 				panic("multiple interrupt actions should not happen in Runner")
 			}
 			interruptSignal = event.Action.internalInterrupted
-			interruptContexts := core.ToInterruptContexts(interruptSignal, encapsulateAddress)
+			interruptContexts := core.ToInterruptContexts(interruptSignal, allowedAddressSegmentTypes)
 			event = &AgentEvent{
 				AgentName: event.AgentName,
 				RunPath:   event.RunPath,

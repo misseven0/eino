@@ -26,6 +26,33 @@ import (
 	"github.com/cloudwego/eino/schema"
 )
 
+type toolResultSender func(toolName, callID, result string)
+
+type enhancedToolResultSender func(toolName, callID string, result *schema.ToolResult)
+type streamToolResultSender func(toolName, callID string, resultStream *schema.StreamReader[string])
+type enhancedStreamToolResultSender func(toolName, callID string, resultStream *schema.StreamReader[*schema.ToolResult])
+type toolResultSenders struct {
+	sender       toolResultSender
+	streamSender streamToolResultSender
+
+	enhancedResultSender           enhancedToolResultSender
+	enhancedStreamToolResultSender enhancedStreamToolResultSender
+}
+
+type toolResultSenderCtxKey struct{}
+
+func setToolResultSendersToCtx(ctx context.Context, senders *toolResultSenders) context.Context {
+	return context.WithValue(ctx, toolResultSenderCtxKey{}, senders)
+}
+
+func getToolResultSendersFromCtx(ctx context.Context) *toolResultSenders {
+	v := ctx.Value(toolResultSenderCtxKey{})
+	if v == nil {
+		return nil
+	}
+	return v.(*toolResultSenders)
+}
+
 type state struct {
 	Messages                 []*schema.Message
 	ReturnDirectlyToolCallID string
@@ -33,6 +60,68 @@ type state struct {
 
 func init() {
 	schema.RegisterName[*state]("_eino_react_state")
+}
+
+func newToolResultCollectorMiddleware() compose.ToolMiddleware {
+	return compose.ToolMiddleware{
+		Invokable: func(next compose.InvokableToolEndpoint) compose.InvokableToolEndpoint {
+			return func(ctx context.Context, input *compose.ToolInput) (*compose.ToolOutput, error) {
+				senders := getToolResultSendersFromCtx(ctx)
+				output, err := next(ctx, input)
+				if err != nil {
+					return nil, err
+				}
+				if senders != nil && senders.sender != nil {
+					senders.sender(input.Name, input.CallID, output.Result)
+				}
+				return output, nil
+			}
+		},
+		Streamable: func(next compose.StreamableToolEndpoint) compose.StreamableToolEndpoint {
+			return func(ctx context.Context, input *compose.ToolInput) (*compose.StreamToolOutput, error) {
+				senders := getToolResultSendersFromCtx(ctx)
+				output, err := next(ctx, input)
+				if err != nil {
+					return nil, err
+				}
+				if senders != nil && senders.streamSender != nil {
+					streams := output.Result.Copy(2)
+					senders.streamSender(input.Name, input.CallID, streams[0])
+					output.Result = streams[1]
+				}
+				return output, nil
+			}
+		},
+		EnhancedInvokable: func(next compose.EnhancedInvokableToolEndpoint) compose.EnhancedInvokableToolEndpoint {
+			return func(ctx context.Context, input *compose.ToolInput) (*compose.EnhancedInvokableToolOutput, error) {
+				senders := getToolResultSendersFromCtx(ctx)
+				output, err := next(ctx, input)
+				if err != nil {
+					return nil, err
+				}
+				if senders != nil && senders.enhancedResultSender != nil {
+					senders.enhancedResultSender(input.Name, input.CallID, output.Result)
+				}
+				return output, nil
+
+			}
+		},
+		EnhancedStreamable: func(next compose.EnhancedStreamableToolEndpoint) compose.EnhancedStreamableToolEndpoint {
+			return func(ctx context.Context, input *compose.ToolInput) (*compose.EnhancedStreamableToolOutput, error) {
+				senders := getToolResultSendersFromCtx(ctx)
+				output, err := next(ctx, input)
+				if err != nil {
+					return nil, err
+				}
+				if senders != nil && senders.enhancedStreamToolResultSender != nil {
+					streams := output.Result.Copy(2)
+					senders.enhancedStreamToolResultSender(input.Name, input.CallID, streams[0])
+					output.Result = streams[1]
+				}
+				return output, nil
+			}
+		},
+	}
 }
 
 const (
@@ -100,10 +189,7 @@ type AgentConfig struct {
 	ToolsNodeName string
 }
 
-// Deprecated: This approach of adding persona involves unnecessary slice copying overhead.
-// Instead, directly include the persona message in the input messages when calling Generate or Stream.
-//
-// NewPersonaModifier add the system prompt as persona before the model is called.
+// NewPersonaModifier returns a MessageModifier that adds a persona message to the input.
 // example:
 //
 //	persona := "You are an expert in golang."
@@ -116,6 +202,9 @@ type AgentConfig struct {
 //	msg, err := agent.Generate(ctx, []*schema.Message{{Role: schema.User, Content: "how to build agent with eino"}})
 //	if err != nil {return}
 //	println(msg.Content)
+//
+// Deprecated: Prefer directly including the persona message in the
+// input when calling Generate or Stream to avoid extra copying.
 func NewPersonaModifier(persona string) MessageModifier {
 	return func(ctx context.Context, input []*schema.Message) []*schema.Message {
 		res := make([]*schema.Message, 0, len(input)+1)
@@ -150,6 +239,7 @@ func firstChunkStreamToolCallChecker(_ context.Context, sr *schema.StreamReader[
 	}
 }
 
+// Default graph and node names for the ReAct agent.
 const (
 	GraphName     = "ReActAgent"
 	ModelNodeName = "ChatModel"
@@ -226,6 +316,11 @@ func NewAgent(ctx context.Context, config *AgentConfig) (_ *Agent, err error) {
 	if chatModel, err = agent.ChatModelWithTools(config.Model, config.ToolCallingModel, toolInfos); err != nil {
 		return nil, err
 	}
+
+	config.ToolsConfig.ToolCallMiddlewares = append(
+		[]compose.ToolMiddleware{newToolResultCollectorMiddleware()},
+		config.ToolsConfig.ToolCallMiddlewares...,
+	)
 
 	if toolsNode, err = compose.NewToolNode(ctx, &config.ToolsConfig); err != nil {
 		return nil, err

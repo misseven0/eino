@@ -25,6 +25,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
 
+	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	mockModel "github.com/cloudwego/eino/internal/mock/components/model"
@@ -147,6 +148,204 @@ func TestChatModelAgentRun(t *testing.T) {
 		assert.False(t, ok)
 
 		assert.True(t, afterChatModelExecuted)
+	})
+
+	t.Run("AfterChatModel_NoTools_ModifyDoesNotAffectEvent", func(t *testing.T) {
+		ctx := context.Background()
+
+		ctrl := gomock.NewController(t)
+		cm := mockModel.NewMockToolCallingChatModel(ctrl)
+
+		cm.EXPECT().Generate(gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(schema.AssistantMessage("original content", nil), nil).
+			Times(1)
+
+		var capturedMessages []*schema.Message
+
+		agent, err := NewChatModelAgent(ctx, &ChatModelAgentConfig{
+			Name:        "TestAgent",
+			Description: "Test agent for AfterChatModel NoTools scenario",
+			Instruction: "You are a helpful assistant.",
+			Model:       cm,
+			Middlewares: []AgentMiddleware{
+				{
+					AfterChatModel: func(ctx context.Context, state *ChatModelAgentState) error {
+						capturedMessages = make([]*schema.Message, len(state.Messages))
+						copy(capturedMessages, state.Messages)
+						state.Messages = append(state.Messages, schema.AssistantMessage("appended content", nil))
+						return nil
+					},
+				},
+			},
+		})
+		assert.NoError(t, err)
+
+		input := &AgentInput{
+			Messages: []Message{schema.UserMessage("Hello")},
+		}
+		iterator := agent.Run(ctx, input)
+
+		event, ok := iterator.Next()
+		assert.True(t, ok)
+		assert.NotNil(t, event)
+		assert.Nil(t, event.Err)
+		assert.NotNil(t, event.Output)
+		assert.NotNil(t, event.Output.MessageOutput)
+
+		msg := event.Output.MessageOutput.Message
+		assert.NotNil(t, msg)
+		assert.Equal(t, "original content", msg.Content)
+
+		_, ok = iterator.Next()
+		assert.False(t, ok)
+
+		assert.Len(t, capturedMessages, 3)
+	})
+
+	t.Run("AfterChatModel_ReAct_ModifyAffectsFlow", func(t *testing.T) {
+		ctx := context.Background()
+
+		ctrl := gomock.NewController(t)
+		cm := mockModel.NewMockToolCallingChatModel(ctrl)
+
+		generateCount := 0
+		cm.EXPECT().Generate(gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(ctx context.Context, msgs []*schema.Message, opts ...model.Option) (*schema.Message, error) {
+				generateCount++
+				if generateCount == 1 {
+					return schema.AssistantMessage("first response with tool call", []schema.ToolCall{
+						{ID: "tc1", Function: schema.FunctionCall{Name: "test_tool", Arguments: "{}"}},
+					}), nil
+				}
+				return schema.AssistantMessage("final response", nil), nil
+			}).AnyTimes()
+		cm.EXPECT().WithTools(gomock.Any()).Return(cm, nil).AnyTimes()
+
+		toolCalled := false
+		testTool := &fakeToolForTest{tarCount: 0}
+
+		agent, err := NewChatModelAgent(ctx, &ChatModelAgentConfig{
+			Name:        "TestAgent",
+			Description: "Test agent for AfterChatModel ReAct scenario",
+			Instruction: "You are a helpful assistant.",
+			Model:       cm,
+			ToolsConfig: ToolsConfig{
+				ToolsNodeConfig: compose.ToolsNodeConfig{
+					Tools: []tool.BaseTool{testTool},
+				},
+			},
+			Middlewares: []AgentMiddleware{
+				{
+					AfterChatModel: func(ctx context.Context, state *ChatModelAgentState) error {
+						lastMsg := state.Messages[len(state.Messages)-1]
+						if len(lastMsg.ToolCalls) > 0 {
+							toolCalled = true
+							state.Messages[len(state.Messages)-1] = schema.AssistantMessage("modified to remove tool call", nil)
+						}
+						return nil
+					},
+				},
+			},
+		})
+		assert.NoError(t, err)
+
+		input := &AgentInput{
+			Messages: []Message{schema.UserMessage("Hello")},
+		}
+		iterator := agent.Run(ctx, input)
+
+		var events []*AgentEvent
+		for {
+			event, ok := iterator.Next()
+			if !ok {
+				break
+			}
+			events = append(events, event)
+		}
+
+		assert.True(t, toolCalled)
+		assert.Equal(t, 1, generateCount)
+
+		assert.Equal(t, 1, len(events))
+		event := events[0]
+		assert.NotNil(t, event.Output)
+		assert.NotNil(t, event.Output.MessageOutput)
+		assert.Equal(t, "first response with tool call", event.Output.MessageOutput.Message.Content)
+		assert.Len(t, event.Output.MessageOutput.Message.ToolCalls, 1)
+	})
+
+	t.Run("AfterChatModel_ReAct_AppendToolCall_AffectsFlow", func(t *testing.T) {
+		ctx := context.Background()
+
+		ctrl := gomock.NewController(t)
+		cm := mockModel.NewMockToolCallingChatModel(ctrl)
+
+		generateCount := 0
+		cm.EXPECT().Generate(gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(ctx context.Context, msgs []*schema.Message, opts ...model.Option) (*schema.Message, error) {
+				generateCount++
+				if generateCount == 1 {
+					return schema.AssistantMessage("first response no tool", nil), nil
+				}
+				return schema.AssistantMessage("final response", nil), nil
+			}).AnyTimes()
+		cm.EXPECT().WithTools(gomock.Any()).Return(cm, nil).AnyTimes()
+
+		testTool := &fakeToolForTest{tarCount: 0}
+
+		agent, err := NewChatModelAgent(ctx, &ChatModelAgentConfig{
+			Name:        "TestAgent",
+			Description: "Test agent for AfterChatModel ReAct append tool call",
+			Instruction: "You are a helpful assistant.",
+			Model:       cm,
+			ToolsConfig: ToolsConfig{
+				ToolsNodeConfig: compose.ToolsNodeConfig{
+					Tools: []tool.BaseTool{testTool},
+				},
+			},
+			Middlewares: []AgentMiddleware{
+				{
+					AfterChatModel: func(ctx context.Context, state *ChatModelAgentState) error {
+						if generateCount == 1 {
+							state.Messages[len(state.Messages)-1] = schema.AssistantMessage("modified with tool call", []schema.ToolCall{
+								{ID: "tc1", Function: schema.FunctionCall{Name: "test_tool", Arguments: "{}"}},
+							})
+						}
+						return nil
+					},
+				},
+			},
+		})
+		assert.NoError(t, err)
+
+		input := &AgentInput{
+			Messages: []Message{schema.UserMessage("Hello")},
+		}
+		iterator := agent.Run(ctx, input)
+
+		var events []*AgentEvent
+		for {
+			event, ok := iterator.Next()
+			if !ok {
+				break
+			}
+			events = append(events, event)
+		}
+
+		assert.Equal(t, 2, generateCount)
+
+		assert.Equal(t, 3, len(events))
+
+		event0 := events[0]
+		assert.NotNil(t, event0.Output)
+		assert.NotNil(t, event0.Output.MessageOutput)
+		assert.Equal(t, "first response no tool", event0.Output.MessageOutput.Message.Content)
+		assert.Empty(t, event0.Output.MessageOutput.Message.ToolCalls)
+
+		event2 := events[2]
+		assert.NotNil(t, event2.Output)
+		assert.NotNil(t, event2.Output.MessageOutput)
+		assert.Equal(t, "final response", event2.Output.MessageOutput.Message.Content)
 	})
 
 	// Test with streaming output
@@ -974,4 +1173,479 @@ func TestStreamToolLegacyNameKeyFallback(t *testing.T) {
 		}
 	}
 	assert.True(t, found)
+}
+
+func TestChatModelAgent_ToolResultMiddleware_EmitsFinalResult(t *testing.T) {
+	originalResult := "original_result"
+	modifiedResult := "modified_by_middleware"
+
+	resultModifyingMiddleware := compose.ToolMiddleware{
+		Invokable: func(next compose.InvokableToolEndpoint) compose.InvokableToolEndpoint {
+			return func(ctx context.Context, input *compose.ToolInput) (*compose.ToolOutput, error) {
+				output, err := next(ctx, input)
+				if err != nil {
+					return nil, err
+				}
+				output.Result = modifiedResult
+				return output, nil
+			}
+		},
+		Streamable: func(next compose.StreamableToolEndpoint) compose.StreamableToolEndpoint {
+			return func(ctx context.Context, input *compose.ToolInput) (*compose.StreamToolOutput, error) {
+				output, err := next(ctx, input)
+				if err != nil {
+					return nil, err
+				}
+				output.Result = schema.StreamReaderFromArray([]string{modifiedResult})
+				return output, nil
+			}
+		},
+	}
+
+	t.Run("Invoke", func(t *testing.T) {
+		ctx := context.Background()
+		testTool := &simpleToolForMiddlewareTest{name: "test_tool", result: originalResult}
+
+		ctrl := gomock.NewController(t)
+		cm := mockModel.NewMockToolCallingChatModel(ctrl)
+
+		info, err := testTool.Info(ctx)
+		assert.NoError(t, err)
+
+		cm.EXPECT().Generate(gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(schema.AssistantMessage("",
+				[]schema.ToolCall{
+					{
+						ID: "tool-call-1",
+						Function: schema.FunctionCall{
+							Name:      info.Name,
+							Arguments: `{"input": "test"}`,
+						},
+					},
+				}), nil).
+			Times(1)
+		cm.EXPECT().Generate(gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(schema.AssistantMessage("final response", nil), nil).
+			Times(1)
+		cm.EXPECT().WithTools(gomock.Any()).Return(cm, nil).AnyTimes()
+
+		agent, err := NewChatModelAgent(ctx, &ChatModelAgentConfig{
+			Name:        "test_agent",
+			Description: "test agent with middleware",
+			Model:       cm,
+			ToolsConfig: ToolsConfig{
+				ToolsNodeConfig: compose.ToolsNodeConfig{
+					Tools:               []tool.BaseTool{testTool},
+					ToolCallMiddlewares: []compose.ToolMiddleware{resultModifyingMiddleware},
+				},
+			},
+		})
+		assert.NoError(t, err)
+
+		r := NewRunner(ctx, RunnerConfig{Agent: agent, EnableStreaming: false, CheckPointStore: newBridgeStore()})
+		it := r.Run(ctx, []Message{schema.UserMessage("call the tool")})
+
+		var toolResultEvents []*AgentEvent
+		for {
+			ev, ok := it.Next()
+			if !ok {
+				break
+			}
+			if ev.Output != nil && ev.Output.MessageOutput != nil &&
+				ev.Output.MessageOutput.Message != nil &&
+				ev.Output.MessageOutput.Message.Role == schema.Tool {
+				toolResultEvents = append(toolResultEvents, ev)
+			}
+		}
+
+		assert.NotEmpty(t, toolResultEvents, "should have at least one tool result event")
+		for _, ev := range toolResultEvents {
+			assert.Equal(t, modifiedResult, ev.Output.MessageOutput.Message.Content,
+				"tool result event should contain the middleware-modified result, not the original")
+			assert.NotEqual(t, originalResult, ev.Output.MessageOutput.Message.Content,
+				"tool result event should NOT contain the original result")
+		}
+	})
+
+	t.Run("Stream", func(t *testing.T) {
+		ctx := context.Background()
+		testTool := &simpleToolForMiddlewareTest{name: "test_tool_stream", result: originalResult}
+
+		ctrl := gomock.NewController(t)
+		cm := mockModel.NewMockToolCallingChatModel(ctrl)
+
+		info, err := testTool.Info(ctx)
+		assert.NoError(t, err)
+
+		cm.EXPECT().Stream(gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(schema.StreamReaderFromArray([]*schema.Message{
+				schema.AssistantMessage("", []schema.ToolCall{
+					{
+						ID: "tool-call-1",
+						Function: schema.FunctionCall{
+							Name:      info.Name,
+							Arguments: `{"input": "test"}`,
+						},
+					},
+				}),
+			}), nil).
+			Times(1)
+		cm.EXPECT().Stream(gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(schema.StreamReaderFromArray([]*schema.Message{
+				schema.AssistantMessage("final response", nil),
+			}), nil).
+			Times(1)
+		cm.EXPECT().WithTools(gomock.Any()).Return(cm, nil).AnyTimes()
+
+		agent, err := NewChatModelAgent(ctx, &ChatModelAgentConfig{
+			Name:        "test_agent",
+			Description: "test agent with middleware",
+			Model:       cm,
+			ToolsConfig: ToolsConfig{
+				ToolsNodeConfig: compose.ToolsNodeConfig{
+					Tools:               []tool.BaseTool{testTool},
+					ToolCallMiddlewares: []compose.ToolMiddleware{resultModifyingMiddleware},
+				},
+			},
+		})
+		assert.NoError(t, err)
+
+		r := NewRunner(ctx, RunnerConfig{Agent: agent, EnableStreaming: true, CheckPointStore: newBridgeStore()})
+		it := r.Run(ctx, []Message{schema.UserMessage("call the tool")})
+
+		var toolResultContents []string
+		for {
+			ev, ok := it.Next()
+			if !ok {
+				break
+			}
+			if ev.Output != nil && ev.Output.MessageOutput != nil {
+				if ev.Output.MessageOutput.Message != nil &&
+					ev.Output.MessageOutput.Message.Role == schema.Tool {
+					toolResultContents = append(toolResultContents, ev.Output.MessageOutput.Message.Content)
+				}
+				if ev.Output.MessageOutput.IsStreaming &&
+					ev.Output.MessageOutput.MessageStream != nil &&
+					ev.Output.MessageOutput.Role == schema.Tool {
+					var msgs []*schema.Message
+					for {
+						msg, err := ev.Output.MessageOutput.MessageStream.Recv()
+						if err != nil {
+							break
+						}
+						msgs = append(msgs, msg)
+					}
+					if len(msgs) > 0 {
+						concated, err := schema.ConcatMessages(msgs)
+						if err == nil {
+							toolResultContents = append(toolResultContents, concated.Content)
+						}
+					}
+				}
+			}
+		}
+
+		assert.NotEmpty(t, toolResultContents, "should have at least one tool result event")
+		for _, content := range toolResultContents {
+			assert.Equal(t, modifiedResult, content,
+				"tool result event should contain the middleware-modified result, not the original")
+			assert.NotEqual(t, originalResult, content,
+				"tool result event should NOT contain the original result")
+		}
+	})
+}
+
+type simpleToolForMiddlewareTest struct {
+	name   string
+	result string
+}
+
+func (s *simpleToolForMiddlewareTest) Info(_ context.Context) (*schema.ToolInfo, error) {
+	return &schema.ToolInfo{
+		Name: s.name,
+		Desc: "simple tool",
+		ParamsOneOf: schema.NewParamsOneOfByParams(
+			map[string]*schema.ParameterInfo{
+				"input": {
+					Desc:     "input",
+					Required: true,
+					Type:     schema.String,
+				},
+			}),
+	}, nil
+}
+
+func (s *simpleToolForMiddlewareTest) InvokableRun(_ context.Context, _ string, _ ...tool.Option) (string, error) {
+	return s.result, nil
+}
+
+func (s *simpleToolForMiddlewareTest) StreamableRun(_ context.Context, _ string, _ ...tool.Option) (*schema.StreamReader[string], error) {
+	return schema.StreamReaderFromArray([]string{s.result}), nil
+}
+
+func TestSendEvent(t *testing.T) {
+	t.Run("SendEventWithoutExecCtx", func(t *testing.T) {
+		ctx := context.Background()
+		event := &AgentEvent{
+			Output: &AgentOutput{
+				MessageOutput: &MessageVariant{
+					Message: schema.AssistantMessage("custom event", nil),
+				},
+			},
+		}
+		err := SendEvent(ctx, event)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "SendEvent failed: must be called within a ChatModelAgent Run() or Resume() execution context")
+	})
+
+	t.Run("SendEventWithNilGenerator", func(t *testing.T) {
+		ctx := context.Background()
+		execCtx := &chatModelAgentExecCtx{
+			generator: nil,
+		}
+		ctx = withChatModelAgentExecCtx(ctx, execCtx)
+
+		event := &AgentEvent{
+			Output: &AgentOutput{
+				MessageOutput: &MessageVariant{
+					Message: schema.AssistantMessage("custom event", nil),
+				},
+			},
+		}
+		err := SendEvent(ctx, event)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "SendEvent failed: must be called within a ChatModelAgent Run() or Resume() execution context")
+	})
+
+	t.Run("SendEventInMiddleware", func(t *testing.T) {
+		ctx := context.Background()
+
+		ctrl := gomock.NewController(t)
+		cm := mockModel.NewMockToolCallingChatModel(ctrl)
+
+		cm.EXPECT().Generate(gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(schema.AssistantMessage("Hello, I am an AI assistant.", nil), nil).
+			Times(1)
+
+		var customEventReceived bool
+		customEventContent := "custom_event_from_middleware"
+
+		agent, err := NewChatModelAgent(ctx, &ChatModelAgentConfig{
+			Name:        "TestAgent",
+			Description: "Test agent for SendEvent",
+			Instruction: "You are a helpful assistant.",
+			Model:       cm,
+			Middlewares: []AgentMiddleware{
+				{
+					BeforeChatModel: func(ctx context.Context, state *ChatModelAgentState) error {
+						customEvent := &AgentEvent{
+							Output: &AgentOutput{
+								MessageOutput: &MessageVariant{
+									Message: schema.AssistantMessage(customEventContent, nil),
+								},
+							},
+						}
+						return SendEvent(ctx, customEvent)
+					},
+				},
+			},
+		})
+		assert.NoError(t, err)
+		assert.NotNil(t, agent)
+
+		input := &AgentInput{
+			Messages: []Message{
+				schema.UserMessage("Hello"),
+			},
+		}
+		iterator := agent.Run(ctx, input)
+		assert.NotNil(t, iterator)
+
+		for {
+			event, ok := iterator.Next()
+			if !ok {
+				break
+			}
+			if event.Output != nil && event.Output.MessageOutput != nil &&
+				event.Output.MessageOutput.Message != nil &&
+				event.Output.MessageOutput.Message.Content == customEventContent {
+				customEventReceived = true
+			}
+		}
+
+		assert.True(t, customEventReceived, "should receive custom event sent from middleware")
+	})
+
+	t.Run("SendEventInMiddlewareWithTools", func(t *testing.T) {
+		ctx := context.Background()
+
+		ctrl := gomock.NewController(t)
+		cm := mockModel.NewMockToolCallingChatModel(ctrl)
+
+		fakeTool := &fakeToolForTest{
+			tarCount: 1,
+		}
+		info, err := fakeTool.Info(ctx)
+		assert.NoError(t, err)
+
+		cm.EXPECT().Generate(gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(schema.AssistantMessage("Using tool",
+				[]schema.ToolCall{
+					{
+						ID: "tool-call-1",
+						Function: schema.FunctionCall{
+							Name:      info.Name,
+							Arguments: `{"name": "test user"}`,
+						},
+					}}), nil).
+			Times(1)
+		cm.EXPECT().Generate(gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(schema.AssistantMessage("Task completed", nil), nil).
+			Times(1)
+		cm.EXPECT().WithTools(gomock.Any()).Return(cm, nil).AnyTimes()
+
+		var customEventReceived bool
+		customEventContent := "custom_event_from_middleware_with_tools"
+
+		agent, err := NewChatModelAgent(ctx, &ChatModelAgentConfig{
+			Name:        "TestAgent",
+			Description: "Test agent for SendEvent with tools",
+			Instruction: "You are a helpful assistant.",
+			Model:       cm,
+			ToolsConfig: ToolsConfig{
+				ToolsNodeConfig: compose.ToolsNodeConfig{
+					Tools: []tool.BaseTool{fakeTool},
+				},
+			},
+			Middlewares: []AgentMiddleware{
+				{
+					BeforeChatModel: func(ctx context.Context, state *ChatModelAgentState) error {
+						customEvent := &AgentEvent{
+							Output: &AgentOutput{
+								MessageOutput: &MessageVariant{
+									Message: schema.AssistantMessage(customEventContent, nil),
+								},
+							},
+						}
+						return SendEvent(ctx, customEvent)
+					},
+				},
+			},
+		})
+		assert.NoError(t, err)
+		assert.NotNil(t, agent)
+
+		input := &AgentInput{
+			Messages: []Message{
+				schema.UserMessage("Use the test tool"),
+			},
+		}
+		iterator := agent.Run(ctx, input)
+		assert.NotNil(t, iterator)
+
+		customEventCount := 0
+		for {
+			event, ok := iterator.Next()
+			if !ok {
+				break
+			}
+			if event.Output != nil && event.Output.MessageOutput != nil &&
+				event.Output.MessageOutput.Message != nil &&
+				event.Output.MessageOutput.Message.Content == customEventContent {
+				customEventReceived = true
+				customEventCount++
+			}
+		}
+
+		assert.True(t, customEventReceived, "should receive custom event sent from middleware with tools")
+		assert.Equal(t, 2, customEventCount, "middleware should be called twice (once for each ChatModel call)")
+	})
+
+	t.Run("SendEventInMiddlewareStreaming", func(t *testing.T) {
+		ctx := context.Background()
+
+		ctrl := gomock.NewController(t)
+		cm := mockModel.NewMockToolCallingChatModel(ctrl)
+
+		sr := schema.StreamReaderFromArray([]*schema.Message{
+			schema.AssistantMessage("Hello", nil),
+			schema.AssistantMessage(", streaming", nil),
+		})
+		cm.EXPECT().Stream(gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(sr, nil).
+			Times(1)
+
+		var customEventReceived bool
+		customEventContent := "custom_event_streaming"
+
+		agent, err := NewChatModelAgent(ctx, &ChatModelAgentConfig{
+			Name:        "TestAgent",
+			Description: "Test agent for SendEvent streaming",
+			Instruction: "You are a helpful assistant.",
+			Model:       cm,
+			Middlewares: []AgentMiddleware{
+				{
+					BeforeChatModel: func(ctx context.Context, state *ChatModelAgentState) error {
+						customEvent := &AgentEvent{
+							Output: &AgentOutput{
+								MessageOutput: &MessageVariant{
+									Message: schema.AssistantMessage(customEventContent, nil),
+								},
+							},
+						}
+						return SendEvent(ctx, customEvent)
+					},
+				},
+			},
+		})
+		assert.NoError(t, err)
+		assert.NotNil(t, agent)
+
+		input := &AgentInput{
+			Messages:        []Message{schema.UserMessage("Hello")},
+			EnableStreaming: true,
+		}
+		iterator := agent.Run(ctx, input)
+		assert.NotNil(t, iterator)
+
+		for {
+			event, ok := iterator.Next()
+			if !ok {
+				break
+			}
+			if event.Output != nil && event.Output.MessageOutput != nil &&
+				event.Output.MessageOutput.Message != nil &&
+				event.Output.MessageOutput.Message.Content == customEventContent {
+				customEventReceived = true
+			}
+		}
+
+		assert.True(t, customEventReceived, "should receive custom event in streaming mode")
+	})
+}
+
+func TestChatModelAgentExecCtx(t *testing.T) {
+	t.Run("WithAndGetExecCtx", func(t *testing.T) {
+		ctx := context.Background()
+
+		result := getChatModelAgentExecCtx(ctx)
+		assert.Nil(t, result)
+
+		execCtx := &chatModelAgentExecCtx{}
+		ctx = withChatModelAgentExecCtx(ctx, execCtx)
+
+		result = getChatModelAgentExecCtx(ctx)
+		assert.NotNil(t, result)
+		assert.Equal(t, execCtx, result)
+	})
+
+	t.Run("ExecCtxSendMethod", func(t *testing.T) {
+		var nilExecCtx *chatModelAgentExecCtx
+		nilExecCtx.send(&AgentEvent{})
+
+		execCtxWithNilGenerator := &chatModelAgentExecCtx{
+			generator: nil,
+		}
+		execCtxWithNilGenerator.send(&AgentEvent{})
+	})
 }

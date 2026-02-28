@@ -14,10 +14,12 @@
  * limitations under the License.
  */
 
+// Package tool defines callback inputs and outputs for tool execution.
 package tool
 
 import (
 	"github.com/cloudwego/eino/callbacks"
+	"github.com/cloudwego/eino/schema"
 )
 
 // CallbackInput is the input for the tool callback.
@@ -32,6 +34,8 @@ type CallbackInput struct {
 type CallbackOutput struct {
 	// Response is the response for the tool.
 	Response string
+	// ToolOutput is the multimodal output for the tool. Used when the tool returns structured data.
+	ToolOutput *schema.ToolResult
 	// Extra is the extra information for the tool.
 	Extra map[string]any
 }
@@ -43,6 +47,8 @@ func ConvCallbackInput(src callbacks.CallbackInput) *CallbackInput {
 		return t
 	case string:
 		return &CallbackInput{ArgumentsInJSON: t}
+	case *schema.ToolArgument:
+		return &CallbackInput{ArgumentsInJSON: t.Text}
 	default:
 		return nil
 	}
@@ -55,6 +61,8 @@ func ConvCallbackOutput(src callbacks.CallbackOutput) *CallbackOutput {
 		return t
 	case string:
 		return &CallbackOutput{Response: t}
+	case *schema.ToolResult:
+		return &CallbackOutput{ToolOutput: t}
 	default:
 		return nil
 	}
